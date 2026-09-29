@@ -88,6 +88,13 @@ def normalize_create(payload):
         "revisions": [],
         "opinions": [],
         "conflict": False,
+        "current_basis": {
+            "source_id": None,
+            "observed_at": None,
+            "miss_distance_m": distance,
+            "covariance_m": covariance,
+            "version": 1,
+        },
         "_stable_key": stable_key,
     }
 

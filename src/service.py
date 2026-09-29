@@ -3,8 +3,13 @@ from .domain import DomainError
 
 
 class Service:
-    def __init__(self, repository):
+    def __init__(self, repository, sender=None):
         self.repository = repository
+        self.sender = sender or self._default_sender
+
+    def _default_sender(self, step):
+        # the demo has no real notification channel, so sending succeeds
+        return
 
     def create_item(self, payload, actor, role, region=None):
         if not actor or not role:
@@ -53,13 +58,70 @@ class Service:
         self.repository.apply_action(
             item_id, action, actor, role, new_status, new_payload, event_payload, expected_version
         )
+        if action in ("approve", "execute"):
+            self._trigger_notifications(item_id, action, new_payload)
         return self.get_item(item_id)
+
+    def _notification_steps(self, action, payload):
+        if action == "approve":
+            orgs = payload.get("operating_organizations", [])
+            maneuver = payload.get("approved_maneuver")
+            if orgs:
+                return [
+                    {
+                        "step_name": "notify_operator:%s" % org,
+                        "payload": {"org": org, "maneuver": maneuver},
+                    }
+                    for org in orgs
+                ]
+            return [{"step_name": "notify_operators", "payload": {"maneuver": maneuver}}]
+        if action == "execute":
+            return [
+                {"step_name": "send_command", "payload": {"command_ref": payload.get("command_ref")}},
+                {"step_name": "notify_execution", "payload": {"command_ref": payload.get("command_ref")}},
+            ]
+        return []
+
+    def _trigger_notifications(self, item_id, action, payload):
+        steps = self._notification_steps(action, payload)
+        if not steps:
+            return {"total": 0, "sent": 0, "failed": 0, "pending": 0}
+        self.repository.create_notification_steps(item_id, action, steps)
+        return self._process_notifications(item_id, action)
+
+    def _process_notifications(self, item_id, trigger_action=None):
+        if trigger_action:
+            steps = self.repository.list_notification_steps(item_id, trigger_action)
+        else:
+            steps = self.repository.pending_notification_steps(item_id)
+        sent = failed = pending = 0
+        for step in steps:
+            if step["status"] == "sent":
+                sent += 1
+                continue
+            try:
+                self.sender(step)
+                self.repository.mark_notification_sent(step["id"])
+                sent += 1
+            except Exception as exc:
+                self.repository.mark_notification_failed(step["id"], str(exc))
+                failed += 1
+        total = len(steps)
+        pending = total - sent - failed
+        return {"total": total, "sent": sent, "failed": failed, "pending": pending}
+
+    def retry_notifications(self, item_id, trigger_action=None):
+        return self._process_notifications(item_id, trigger_action)
+
+    def list_notifications(self, item_id):
+        return self.repository.list_notification_steps(item_id)
 
     def get_item(self, item_id):
         item = self.repository.get_item(item_id)
         item["sources"] = self.repository.list_sources(item_id)
         item["audit"] = self.repository.audit_trail(item_id)
         item["assessment"] = rules.assess(item["payload"])
+        item["notifications"] = self.repository.list_notification_steps(item_id)
         return item
 
     def list_items(self, status=None):

@@ -106,14 +106,21 @@ def apply_action(item, action, payload, actor, role):
         if fuel > budget:
             raise DomainError("fuel_budget_exceeded", "规避燃料超过预算", 409)
         window = _require_text(payload, "maneuver_window")
-        current["approved_maneuver"] = {"fuel_cost_m_s": fuel, "maneuver_window": window}
+        basis_version = (current.get("current_basis") or {}).get("version", 1)
+        current["approved_maneuver"] = {
+            "fuel_cost_m_s": fuel,
+            "maneuver_window": window,
+            "basis_version": basis_version,
+        }
         return "coordinating", current, {"approved_maneuver": current["approved_maneuver"]}
 
     if action == "execute":
         _need_status(item, {"coordinating"})
         command_ref = _require_text(payload, "command_ref")
+        basis_version = (current.get("current_basis") or {}).get("version", 1)
         current["command_ref"] = command_ref
-        return "executing", current, {"command_ref": command_ref}
+        current["command_basis_version"] = basis_version
+        return "executing", current, {"command_ref": command_ref, "basis_version": basis_version}
 
     if action == "resolve":
         _need_status(item, {"executing"})

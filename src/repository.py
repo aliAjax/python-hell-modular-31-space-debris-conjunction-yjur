@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
+from .rules import assess
 
 
 def now_iso():
@@ -18,6 +19,11 @@ class Repository:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _ensure_column(self, conn, table, column, ddl):
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(%s)" % table).fetchall()]
+        if column not in cols:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, ddl))
 
     def initialize(self):
         conn = self.connect()
@@ -45,6 +51,8 @@ class Repository:
                     external_id TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    version INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, source_type, external_id),
                     FOREIGN KEY(item_id) REFERENCES items(id)
@@ -70,8 +78,26 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS notification_steps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    trigger_action TEXT NOT NULL,
+                    step_name TEXT NOT NULL,
+                    step_order INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(item_id, trigger_action, step_name),
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
                 """
             )
+            # lightweight migration for databases created before the version chain
+            self._ensure_column(conn, "sources", "status", "TEXT NOT NULL DEFAULT 'pending'")
+            self._ensure_column(conn, "sources", "version", "INTEGER NOT NULL DEFAULT 1")
         finally:
             conn.close()
 
@@ -161,30 +187,141 @@ class Repository:
             conn.close()
 
     def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+        """Record a source and select the current basis by observation time.
+
+        The source joins the shared version chain. A source with a later
+        observed_at becomes the current basis; a late source with an older
+        observed_at stays in history; a source tied with the current basis on
+        observed_at stays pending confirmation. When the basis changes, an
+        unexecuted approval is invalidated while an already-issued execution
+        retains the basis it was issued under.
+        """
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
-            if item is None:
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
+            item = self._row_to_item(row)
+            new_version = item["version"] + 1
+
+            current_basis = item["payload"].get("current_basis") or {}
+            basis_changed = False
+            blocked_actions = []
+            old_basis = None
+
+            if current_basis.get("source_id") is None:
+                # the initial payload has no observed_at, so the first source
+                # always becomes the current basis
+                source_status = "current"
+                basis_changed = True
+            elif observed_at > current_basis.get("observed_at"):
+                source_status = "current"
+                basis_changed = True
+            elif observed_at < current_basis.get("observed_at"):
+                # late-arriving record with an older observation time: history only
+                source_status = "history"
+            else:
+                # same observation time as the current basis: cannot decide,
+                # keep the new source pending confirmation
+                source_status = "pending"
+
             try:
                 conn.execute(
-                    "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, source_type, external_id, canonical_json(payload), observed_at, now_iso()),
+                    "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,status,version,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (item_id, source_type, external_id, canonical_json(payload), observed_at, source_status, new_version, now_iso()),
                 )
             except sqlite3.IntegrityError:
                 raise ConflictError("duplicate_source", "同一来源记录已经提交")
             source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+            new_payload = dict(item["payload"])
+
+            if basis_changed:
+                old_basis = dict(current_basis)
+                if current_basis.get("source_id") is not None:
+                    conn.execute(
+                        "UPDATE sources SET status='history' WHERE id=? AND item_id=?",
+                        (current_basis["source_id"], item_id),
+                    )
+                new_payload["current_basis"] = {
+                    "source_id": source_id,
+                    "observed_at": observed_at,
+                    "miss_distance_m": payload["miss_distance_m"],
+                    "covariance_m": payload["covariance_m"],
+                    "version": new_version,
+                }
+                new_payload["miss_distance_m"] = payload["miss_distance_m"]
+                new_payload["covariance_m"] = payload["covariance_m"]
+                new_payload["assessment"] = assess(new_payload)
+
+                approved = new_payload.get("approved_maneuver")
+                if approved and not new_payload.get("command_ref"):
+                    # approval was given but the maneuver has not been issued:
+                    # it is invalidated by the basis change
+                    blocked_actions.append("execute")
+                    new_payload.pop("approved_maneuver", None)
+                    new_status = "assessed"
+                else:
+                    # an already-issued execution retains the basis it was
+                    # issued under; the basis change does not unwind it
+                    new_status = item["status"]
+
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "basis_changed",
+                    actor,
+                    role,
+                    {
+                        "source_id": source_id,
+                        "old_basis": old_basis,
+                        "new_basis": new_payload["current_basis"],
+                        "blocked_actions": blocked_actions,
+                        "approval_invalidated": bool(blocked_actions),
+                    },
+                )
+            else:
+                new_status = item["status"]
+
             self.append_audit(
                 conn,
                 item_id,
                 "source_recorded",
                 actor,
                 role,
-                {"source_id": source_id, "source_type": source_type, "external_id": external_id},
+                {
+                    "source_id": source_id,
+                    "source_type": source_type,
+                    "external_id": external_id,
+                    "observed_at": observed_at,
+                    "basis_status": source_status,
+                    "basis_changed": basis_changed,
+                },
+            )
+
+            conn.execute(
+                "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                (new_status, new_version, canonical_json(new_payload), now_iso(), item_id),
             )
             conn.execute("COMMIT")
-            return {"id": source_id, "item_id": item_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+
+            source_record = {
+                "id": source_id,
+                "item_id": item_id,
+                "source_type": source_type,
+                "external_id": external_id,
+                "payload": payload,
+                "observed_at": observed_at,
+                "status": source_status,
+                "version": new_version,
+            }
+            return {
+                "source": source_record,
+                "basis_changed": basis_changed,
+                "blocked_actions": blocked_actions,
+                "current_basis": new_payload.get("current_basis"),
+            }
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -234,6 +371,94 @@ class Repository:
             except sqlite3.Error:
                 pass
             raise
+        finally:
+            conn.close()
+
+    def create_notification_steps(self, item_id, trigger_action, steps):
+        """Idempotently create notification steps for a trigger action.
+
+        Steps already present (same item, trigger, step name) are kept, so a
+        restart does not duplicate instructions.
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for idx, step in enumerate(steps):
+                conn.execute(
+                    "INSERT OR IGNORE INTO notification_steps(item_id,trigger_action,step_name,step_order,status,attempts,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        item_id,
+                        trigger_action,
+                        step["step_name"],
+                        idx,
+                        "pending",
+                        0,
+                        canonical_json(step.get("payload", {})),
+                        now_iso(),
+                        now_iso(),
+                    ),
+                )
+            conn.execute("COMMIT")
+            return self.list_notification_steps(item_id, trigger_action)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def list_notification_steps(self, item_id, trigger_action=None):
+        conn = self.connect()
+        try:
+            if trigger_action:
+                rows = conn.execute(
+                    "SELECT * FROM notification_steps WHERE item_id=? AND trigger_action=? ORDER BY step_order, id",
+                    (item_id, trigger_action),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM notification_steps WHERE item_id=? ORDER BY trigger_action, step_order, id",
+                    (item_id,),
+                ).fetchall()
+            result = []
+            for row in rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"])
+                result.append(value)
+            return result
+        finally:
+            conn.close()
+
+    def pending_notification_steps(self, item_id):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM notification_steps WHERE item_id=? AND status IN ('pending','failed') ORDER BY id",
+                (item_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def mark_notification_sent(self, step_id):
+        conn = self.connect()
+        try:
+            conn.execute(
+                "UPDATE notification_steps SET status='sent', updated_at=? WHERE id=?",
+                (now_iso(), step_id),
+            )
+        finally:
+            conn.close()
+
+    def mark_notification_failed(self, step_id, error):
+        conn = self.connect()
+        try:
+            conn.execute(
+                "UPDATE notification_steps SET status='failed', attempts=attempts+1, last_error=?, updated_at=? WHERE id=?",
+                (error, now_iso(), step_id),
+            )
         finally:
             conn.close()
 
