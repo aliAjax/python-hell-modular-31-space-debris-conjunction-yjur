@@ -58,6 +58,17 @@ def build_handler(service, static_dir):
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
+                if len(parts) == 5 and parts[:2] == ["api", "items"] and parts[3] == "sources":
+                    item = service.get_item(int(parts[2]))
+                    source_id = int(parts[4])
+                    source = next((s for s in item["sources"] if s["id"] == source_id), None)
+                    if source is None:
+                        return self._send(404, {"error": "source_not_found", "message": "来源记录不存在"})
+                    return self._send(200, {"source": source})
+                if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[3] == "dispatch":
+                    return self._send(200, service.run_dispatch(int(parts[2]), actor, role))
+                if len(parts) == 3 and parts[:2] == ["api", "plans"]:
+                    return self._send(200, service.repository.get_plan(int(parts[2])))
                 if path == "/":
                     file_path = os.path.join(static_dir, "index.html")
                     with open(file_path, "rb") as handle:
@@ -78,13 +89,20 @@ def build_handler(service, static_dir):
                 parts = [part for part in path.split("/") if part]
                 if parts == ["api", "items"]:
                     return self._send(201, service.create_item(payload, actor, role, region))
+                if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[3] == "dispatch":
+                    return self._send(200, service.run_dispatch(int(parts[2]), actor, role))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
-                    return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
+                    expected = payload.pop("expected_version", None)
+                    return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region, expected))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":
                     action = payload.pop("action", "")
                     if not action:
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
+                    if action == "confirm_source":
+                        source_id = payload.get("source_id")
+                        return self._send(200, service.confirm_source(
+                            int(parts[2]), int(source_id), actor, role, expected))
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
